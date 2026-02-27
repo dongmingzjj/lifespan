@@ -70,7 +70,8 @@ pub async fn get_server_config(
     sync_client: tauri::State<'_, SyncClient>,
 ) -> Result<ServerConfig, String> {
     sync_client.get_config().await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No configuration found".to_string())
 }
 
 /// Set server configuration
