@@ -14,7 +14,7 @@ use tauri::Manager;
 
 fn main() {
   tauri::Builder::default()
-    .setup(|app| {
+    .setup(|app| async move {
       // Initialize database
       let app_data_dir = app.path().app_local_data_dir()
         .expect("Failed to get app data dir");
