@@ -34,6 +34,12 @@ fn main() {
       // Initialize sync client
       let sync_client = SyncClient::new(db_arc.clone());
 
+      // Initialize crypto key for sync (use default key for development)
+      // In production, this should be derived from user password
+      let default_key = b"lifespan-dev-key-32-bytes-long!!";  // 32 bytes for AES-256
+      sync_client.set_crypto_key(*default_key)
+        .expect("Failed to initialize crypto key");
+
       // Store in app state
       app.manage(Arc::new(tokio::sync::Mutex::new(collector)));
       app.manage(sync_client);
