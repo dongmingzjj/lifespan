@@ -557,16 +557,6 @@ impl SyncClient {
     }
 }
 
-// Async wrapper for database operations
-impl Database {
-    pub fn get_unsynced_events_sync(&self) -> Result<Vec<StoredEvent>> {
-        // This is a blocking operation, should be called from spawn_blocking
-        // For now, we'll call the existing method directly
-        // In production, use tokio::task::spawn_blocking
-        self.get_unsynced_events()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

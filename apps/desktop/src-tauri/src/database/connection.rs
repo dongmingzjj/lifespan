@@ -260,6 +260,12 @@ impl Database {
 
     Ok(())
   }
+
+  /// Synchronous wrapper for get_unsynced_events
+  /// This method exists to be called from spawn_blocking in async contexts
+  pub fn get_unsynced_events_sync(&self) -> Result<Vec<StoredEvent>> {
+    self.get_unsynced_events()
+  }
 }
 
 #[cfg(test)]
