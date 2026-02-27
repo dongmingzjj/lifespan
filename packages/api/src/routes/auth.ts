@@ -14,6 +14,7 @@ import {
   generateAccessToken,
   generateRefreshToken,
   verifyToken,
+  authMiddleware,
   type AuthenticatedRequest,
 } from '../middleware/auth.js';
 import { authRateLimiter } from '../middleware/rateLimit.js';
@@ -346,6 +347,7 @@ router.post(
 // POST /api/v1/auth/logout
 router.post(
   '/logout',
+  authMiddleware,
   async (req: Request, res: Response) => {
     const requestId = generateRequestId();
     const authReq = req as AuthenticatedRequest;
@@ -356,12 +358,76 @@ router.post(
 
     logger.info({
       requestId,
-      userId: authReq.user?.id,
+      userId: authReq.user.id,
     }, 'User logout');
 
     res.status(200).json({
       message: 'Logged out successfully',
     });
+  }
+);
+
+// GET /api/v1/auth/me
+// Get current user information
+router.get(
+  '/me',
+  authMiddleware,
+  async (req: Request, res: Response) => {
+    const requestId = generateRequestId();
+    const authReq = req as AuthenticatedRequest;
+
+    try {
+      logger.info({
+        requestId,
+        userId: authReq.user.id,
+      }, 'User profile request');
+
+      // Fetch user information from database
+      const result = await query(
+        'SELECT id, username, email, created_at, last_sync_at FROM users WHERE id = $1',
+        [authReq.user.id]
+      );
+
+      if (result.rows.length === 0) {
+        logger.warn({
+          requestId,
+          userId: authReq.user.id,
+        }, 'User not found in database');
+
+        return res.status(404).json({
+          error: 'not_found',
+          message: 'User not found',
+        });
+      }
+
+      const user = result.rows[0];
+
+      logger.info({
+        requestId,
+        userId: user.id,
+      }, 'User profile retrieved');
+
+      res.status(200).json({
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        created_at: user.created_at,
+        last_sync_at: user.last_sync_at,
+      });
+    } catch (error) {
+      logger.error({
+        requestId,
+        userId: authReq.user.id,
+        err: error,
+        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        errorStack: error instanceof Error ? error.stack : undefined,
+      }, 'Failed to retrieve user profile');
+
+      res.status(500).json({
+        error: 'internal_error',
+        message: 'Failed to retrieve user profile',
+      });
+    }
   }
 );
 
