@@ -150,6 +150,7 @@ function App() {
     }, 1000);
 
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status.is_running]);
 
   // Poll sync status every 5 seconds
