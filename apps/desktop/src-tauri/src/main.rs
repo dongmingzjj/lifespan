@@ -14,7 +14,7 @@ use tauri::Manager;
 
 fn main() {
   tauri::Builder::default()
-    .setup(|app| async move {
+    .setup(|app| {
       // Initialize database
       let app_data_dir = app.path().app_local_data_dir()
         .expect("Failed to get app data dir");
@@ -36,16 +36,18 @@ fn main() {
 
       // Initialize crypto key for sync (use default key for development)
       // In production, this should be derived from user password
+      // Use tokio runtime to run async initialization
+      let runtime = tokio::runtime::Runtime::new()
+        .expect("Failed to create tokio runtime");
       let default_key = b"lifespan-dev-key-32-bytes-long!!";  // 32 bytes for AES-256
-      sync_client.set_crypto_key(*default_key).await
-        .expect("Failed to initialize crypto key");
+      runtime.block_on(async {
+        sync_client.set_crypto_key(*default_key).await
+          .expect("Failed to initialize crypto key");
+      });
 
       // Store in app state
       app.manage(Arc::new(tokio::sync::Mutex::new(collector)));
       app.manage(sync_client);
-
-      Ok(())
-    })
     .invoke_handler(tauri::generate_handler![
       commands::start_tracking,
       commands::stop_tracking,
