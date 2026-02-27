@@ -126,7 +126,14 @@ function App() {
   // Save server config
   const saveConfig = async () => {
     try {
-      await invoke("set_server_config", { config: serverConfig });
+      // Generate device_id if empty
+      let configToSave = { ...serverConfig };
+      if (!configToSave.device_id || configToSave.device_id.trim() === "") {
+        // Generate UUID v4
+        configToSave.device_id = crypto.randomUUID();
+      }
+
+      await invoke("set_server_config", { config: configToSave });
       setShowSettings(false);
       await fetchSyncStatus();
     } catch (error) {

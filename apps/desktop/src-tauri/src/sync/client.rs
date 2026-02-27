@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,15 +38,13 @@ struct SyncResponse {
 /// Event to send to server
 #[derive(Debug, Serialize)]
 struct SyncEvent {
+    id: String,                                // UUID
     event_type: String,
     timestamp: i64,
     duration: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    encrypted_data: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iv: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_tag: Option<String>,
+    encrypted_data: String,                    // Required
+    nonce: String,                             // 12 bytes in hex (24 chars)
+    tag: String,                               // 16 bytes base64url (44 chars)
     app_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<String>,
@@ -327,37 +326,55 @@ impl SyncClient {
         let mut sync_events = Vec::new();
 
         for event in events {
-            // Check if we need to encrypt sensitive data
-            let (encrypted_data, iv, auth_tag) = if let Some(window_title) = &event.window_title {
-                // Encrypt window title (sensitive data)
-                let crypto = self.crypto.lock().await;
-                if let Some(crypto) = crypto.as_ref() {
-                    let plaintext = window_title.as_bytes();
-                    let encrypted = crypto.encrypt(plaintext)
-                        .map_err(|e| SyncError::Encryption(format!("Failed to encrypt: {}", e)))?;
+            // Generate UUID for event
+            let id = Uuid::new_v4().to_string();
 
-                    (
-                        Some(base64::engine::general_purpose::STANDARD.encode(&encrypted.ciphertext)),
-                        Some(base64::engine::general_purpose::STANDARD.encode(&encrypted.nonce)),
-                        None, // AES-GCM auth tag is embedded in ciphertext
-                    )
-                } else {
-                    (None, None, None)
-                }
+            // Prepare data to encrypt (use app_name or window_title)
+            let plaintext = event.window_title.as_ref()
+                .map(|s| s.as_bytes())
+                .unwrap_or_else(|| event.app_name.as_bytes());
+
+            // Encrypt data
+            let crypto = self.crypto.lock().await;
+            let encrypted = if let Some(crypto) = crypto.as_ref() {
+                crypto.encrypt(plaintext)
+                    .map_err(|e| SyncError::Encryption(format!("Failed to encrypt: {}", e)))?
             } else {
-                (None, None, None)
+                // If no crypto manager, create dummy encrypted data
+                return Err(SyncError::Encryption("Crypto manager not initialized".to_string()));
             };
+
+            // Extract nonce (12 bytes) and encode as hex (24 chars)
+            let nonce = hex::encode(&encrypted.nonce);
+
+            // Extract tag from ciphertext (last 16 bytes of AES-GCM)
+            let tag_len = 16;
+            let ciphertext_len = encrypted.ciphertext.len();
+            if ciphertext_len < tag_len {
+                return Err(SyncError::Encryption("Invalid ciphertext length".to_string()));
+            }
+            let tag_bytes = &encrypted.ciphertext[ciphertext_len - tag_len..];
+            let tag = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag_bytes);
+
+            // Encode full ciphertext (including tag) as base64
+            let encrypted_data = base64::engine::general_purpose::STANDARD.encode(&encrypted.ciphertext);
 
             // Determine category
             let category = self.categorize_app(&event.app_name);
 
+            // Ensure timestamp is not in the future
+            let now_millis = Utc::now().timestamp_millis();
+            let timestamp = event.timestamp.timestamp_millis();
+            let timestamp = timestamp.min(now_millis); // Cap at current time
+
             let sync_event = SyncEvent {
+                id,
                 event_type: event.event_type.clone(),
-                timestamp: event.timestamp.timestamp_millis(),
+                timestamp,
                 duration: event.duration,
                 encrypted_data,
-                iv,
-                auth_tag,
+                nonce,
+                tag,
                 app_name: event.app_name.clone(),
                 category,
             };
