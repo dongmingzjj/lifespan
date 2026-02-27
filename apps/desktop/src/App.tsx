@@ -133,11 +133,14 @@ function App() {
         configToSave.device_id = crypto.randomUUID();
       }
 
+      console.log("Saving config:", configToSave);
       await invoke("set_server_config", { config: configToSave });
+      console.log("Config saved successfully");
       setShowSettings(false);
       await fetchSyncStatus();
     } catch (error) {
       console.error("Failed to save config:", error);
+      alert(`Failed to save configuration: ${error}`);
     }
   };
 
