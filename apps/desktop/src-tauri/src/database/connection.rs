@@ -141,7 +141,7 @@ impl Database {
       Ok(StoredEvent {
         id: row.get(0)?,
         event_type: row.get(1)?,
-        timestamp: DateTime::from_timestamp(row.get::<_, i64>(2)? / 1000, 0)
+        timestamp: DateTime::from_timestamp_millis(row.get::<_, i64>(2)?)
           .unwrap_or_default(),
         duration: row.get(3)?,
         app_name: row.get(4)?,
@@ -174,7 +174,7 @@ impl Database {
       Ok(StoredEvent {
         id: row.get(0)?,
         event_type: row.get(1)?,
-        timestamp: DateTime::from_timestamp(row.get::<_, i64>(2)? / 1000, 0)
+        timestamp: DateTime::from_timestamp_millis(row.get::<_, i64>(2)?)
           .unwrap_or_default(),
         duration: row.get(3)?,
         app_name: row.get(4)?,
