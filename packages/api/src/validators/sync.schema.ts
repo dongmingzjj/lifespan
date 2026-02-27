@@ -67,7 +67,7 @@ export const EncryptedEventSchema = z.object({
   nonce: z.string()
     .length(24, 'Nonce must be 24 characters (12 bytes in hex)'), // 12 bytes in hex
   tag: z.string()
-    .length(44, 'Auth tag must be 44 characters (16 bytes base64url)'), // 16 bytes base64url
+    .length(24, 'Auth tag must be 24 characters (16 bytes base64 with padding)'), // 16 bytes base64
   // Optional searchable plaintext fields
   app_name: z.string().max(255).optional(),
   category: z.enum(['work', 'communication', 'entertainment', 'learning', 'utility', 'other']).optional(),

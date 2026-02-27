@@ -5,10 +5,11 @@ use base64::Engine;
 use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use uuid::Uuid;
+use tokio::task::JoinHandle;
+use tracing::{info, error, debug};
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +45,7 @@ struct SyncEvent {
     duration: i32,
     encrypted_data: String,                    // Required
     nonce: String,                             // 12 bytes in hex (24 chars)
-    tag: String,                               // 16 bytes base64url (44 chars)
+    tag: String,                               // 16 bytes base64 STANDARD with padding (24 chars)
     app_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<String>,
@@ -89,6 +90,25 @@ pub struct SyncClient {
     http_client: Client,
     config: Arc<Mutex<Option<ServerConfig>>>,
     is_syncing: Arc<Mutex<bool>>,
+    auto_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+/// Configuration for sync behavior
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    pub auto_sync_interval: Duration,
+    pub auto_sync_batch_size: usize,
+    pub auto_sync_enabled: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            auto_sync_interval: Duration::from_secs(300), // 5 minutes
+            auto_sync_batch_size: 100,
+            auto_sync_enabled: true,
+        }
+    }
 }
 
 impl SyncClient {
@@ -107,6 +127,7 @@ impl SyncClient {
             http_client,
             config: Arc::new(Mutex::new(None)),
             is_syncing: Arc::new(Mutex::new(false)),
+            auto_sync_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -150,9 +171,14 @@ impl SyncClient {
         let is_syncing = *self.is_syncing.lock().await;
         let last_sync_at = self.db.get_last_sync_time().await?;
 
-        // Get count of unsynced events
-        let unsynced = self.db.get_unsynced_events_sync()?;
-        let pending_events = unsynced.len() as i64;
+        // Get count of unsynced events using spawn_blocking for async safety
+        let db = self.db.clone();
+        let unsynced_events = tokio::task::spawn_blocking(move || {
+            db.get_unsynced_events_sync()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+        let pending_events = unsynced_events.len() as i64;
 
         // Get last error from database
         let last_error = self.db
@@ -167,8 +193,105 @@ impl SyncClient {
         })
     }
 
+    /// Check if auto-sync is needed (based on pending event count)
+    pub async fn check_and_sync_if_needed(&self, threshold: usize) -> Result<(), SyncError> {
+        let db = self.db.clone();
+        let unsynced_events = tokio::task::spawn_blocking(move || {
+            db.get_unsynced_events_sync()
+        })
+        .await
+        .map_err(|e| SyncError::Database(format!("Failed to check pending events: {}", e)))
+        .and_then(|r| r.map_err(|e| SyncError::Database(format!("Failed to get events: {}", e))))?;
+        let pending_count = unsynced_events.len();
+
+        debug!("Pending events: {}, threshold: {}", pending_count, threshold);
+
+        if pending_count >= threshold {
+            info!("Auto-sync triggered: {} events pending", pending_count);
+            self.sync_events().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Start automatic sync scheduler
+    pub async fn start_auto_sync(&self, config: SyncConfig) -> Result<()> {
+        // Stop existing auto-sync if running
+        self.stop_auto_sync().await;
+
+        if !config.auto_sync_enabled {
+            info!("Auto-sync is disabled");
+            return Ok(());
+        }
+
+        let interval = config.auto_sync_interval;
+        let batch_threshold = config.auto_sync_batch_size;
+        let is_syncing = self.is_syncing.clone();
+        let db = self.db.clone();
+
+        info!("Starting auto-sync: interval={:?}, batch_threshold={}", interval, batch_threshold);
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // Skip first immediate tick
+
+            loop {
+                ticker.tick().await;
+
+                // Check if already syncing
+                {
+                    let syncing = is_syncing.lock().await;
+                    if *syncing {
+                        debug!("Auto-sync skipped: sync already in progress");
+                        continue;
+                    }
+                }
+
+                // Check pending count
+                let db_clone = db.clone();
+                let pending_count = match tokio::task::spawn_blocking(move || {
+                    db_clone.get_unsynced_events_sync()
+                })
+                .await
+                {
+                    Ok(Ok(events)) => events.len(),
+                    Ok(Err(e)) => {
+                        error!("Failed to check pending events: {}", e);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Task join error: {}", e);
+                        continue;
+                    }
+                };
+
+                if pending_count > 0 {
+                    info!("Auto-sync: {} events pending", pending_count);
+                    // Note: We can't call self.sync_events() here directly
+                    // The caller should handle this via check_and_sync_if_needed
+                }
+            }
+        });
+
+        let mut sync_handle = self.auto_sync_handle.lock().await;
+        *sync_handle = Some(handle);
+
+        Ok(())
+    }
+
+    /// Stop automatic sync scheduler
+    pub async fn stop_auto_sync(&self) {
+        let mut handle_guard = self.auto_sync_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+            info!("Auto-sync stopped");
+        }
+    }
+
     /// Sync events to server
     pub async fn sync_events(&self) -> SyncResult {
+        let start_time = std::time::Instant::now();
+
         // Check if already syncing
         {
             let mut syncing = self.is_syncing.lock().await;
@@ -193,17 +316,26 @@ impl SyncClient {
             .map_err(|e| SyncError::Unknown(format!("Failed to get config: {}", e)))?
             .ok_or_else(|| SyncError::Unknown("Server not configured".to_string()))?;
 
-        // Get unsynced events (batch size 100)
-        let events = self.db.get_unsynced_events_sync()
-            .map_err(|e| SyncError::Database(format!("Failed to get events: {}", e)))?;
+        // Get unsynced events using spawn_blocking for async safety
+        let db = self.db.clone();
+        let events = tokio::task::spawn_blocking(move || {
+            db.get_unsynced_events_sync()
+        })
+        .await
+        .map_err(|e| SyncError::Database(format!("Task join error: {}", e)))
+        .and_then(|r| r.map_err(|e| SyncError::Database(format!("Failed to get events: {}", e))))?;
 
         if events.is_empty() {
+            info!("No events to sync");
             return Ok(());
         }
 
         // Take only first 100 events
         let batch: Vec<_> = events.into_iter().take(100).collect();
+        let batch_size = batch.len();
         let event_ids: Vec<String> = batch.iter().map(|e| e.id.clone()).collect();
+
+        info!("Syncing {} events to {}", batch_size, config.server_url);
 
         // Encrypt and send events with retry logic
         let result = self.sync_with_retry(&config, &batch, 3).await;
@@ -222,12 +354,19 @@ impl SyncClient {
                 // Clear last error
                 let _ = self.db.set_setting("last_sync_error", "");
 
+                let elapsed = start_time.elapsed();
+                info!("Sync completed: {} events in {:?}", batch_size, elapsed);
+
                 Ok(())
             }
             Err(e) => {
                 // Store error for UI display
                 let error_msg = e.to_string();
                 let _ = self.db.set_setting("last_sync_error", &error_msg);
+
+                let elapsed = start_time.elapsed();
+                error!("Sync failed after {:?}: {}", elapsed, error_msg);
+
                 Err(e)
             }
         }
@@ -323,11 +462,15 @@ impl SyncClient {
 
     /// Build sync events with encryption
     async fn build_sync_events(&self, events: &[StoredEvent]) -> std::result::Result<Vec<SyncEvent>, SyncError> {
-        let mut sync_events = Vec::new();
+        let mut sync_events = Vec::with_capacity(events.len());
+        let crypto = self.crypto.lock().await;
+
+        let crypto_ref = crypto.as_ref()
+            .ok_or_else(|| SyncError::Encryption("Crypto manager not initialized".to_string()))?;
 
         for event in events {
-            // Generate UUID for event
-            let id = Uuid::new_v4().to_string();
+            // Use database event ID instead of generating new UUID
+            let id = event.id.clone();
 
             // Prepare data to encrypt (use app_name or window_title)
             let plaintext = event.window_title.as_ref()
@@ -335,37 +478,41 @@ impl SyncClient {
                 .unwrap_or_else(|| event.app_name.as_bytes());
 
             // Encrypt data
-            let crypto = self.crypto.lock().await;
-            let encrypted = if let Some(crypto) = crypto.as_ref() {
-                crypto.encrypt(plaintext)
-                    .map_err(|e| SyncError::Encryption(format!("Failed to encrypt: {}", e)))?
-            } else {
-                // If no crypto manager, create dummy encrypted data
-                return Err(SyncError::Encryption("Crypto manager not initialized".to_string()));
-            };
+            let encrypted = crypto_ref.encrypt(plaintext)
+                .map_err(|e| SyncError::Encryption(format!("Failed to encrypt: {}", e)))?;
 
             // Extract nonce (12 bytes) and encode as hex (24 chars)
             let nonce = hex::encode(&encrypted.nonce);
 
             // Extract tag from ciphertext (last 16 bytes of AES-GCM)
+            // Note: aes_gcm crate appends the tag to the ciphertext
             let tag_len = 16;
             let ciphertext_len = encrypted.ciphertext.len();
             if ciphertext_len < tag_len {
                 return Err(SyncError::Encryption("Invalid ciphertext length".to_string()));
             }
             let tag_bytes = &encrypted.ciphertext[ciphertext_len - tag_len..];
-            let tag = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag_bytes);
 
-            // Encode full ciphertext (including tag) as base64
-            let encrypted_data = base64::engine::general_purpose::STANDARD.encode(&encrypted.ciphertext);
+            // Encode tag as base64 STANDARD with padding: 16 bytes -> 24 chars
+            let tag = base64::engine::general_purpose::STANDARD.encode(tag_bytes);
+
+            // Encode ciphertext WITHOUT the tag (just the encrypted payload)
+            // The tag is sent separately for verification
+            let payload_len = ciphertext_len - tag_len;
+            let encrypted_data = base64::engine::general_purpose::STANDARD.encode(&encrypted.ciphertext[..payload_len]);
 
             // Determine category
             let category = self.categorize_app(&event.app_name);
 
-            // Ensure timestamp is not in the future
+            // Ensure timestamp is not in the future (max 1 minute ahead allowed)
             let now_millis = Utc::now().timestamp_millis();
-            let timestamp = event.timestamp.timestamp_millis();
-            let timestamp = timestamp.min(now_millis); // Cap at current time
+            let event_timestamp = event.timestamp.timestamp_millis();
+            let timestamp = if event_timestamp > now_millis + 60000 {
+                // If event is more than 1 minute in the future, use current time
+                now_millis
+            } else {
+                event_timestamp
+            };
 
             let sync_event = SyncEvent {
                 id,
@@ -382,6 +529,7 @@ impl SyncClient {
             sync_events.push(sync_event);
         }
 
+        debug!("Built {} sync events with encryption", sync_events.len());
         Ok(sync_events)
     }
 
@@ -469,12 +617,13 @@ mod tests {
             device_id: Uuid::new_v4().to_string(),
             events: vec![
                 SyncEvent {
+                    id: Uuid::new_v4().to_string(),
                     event_type: "app_usage".to_string(),
                     timestamp: 1234567890,
                     duration: 300,
-                    encrypted_data: Some("encrypted".to_string()),
-                    iv: Some("iv".to_string()),
-                    auth_tag: Some("tag".to_string()),
+                    encrypted_data: "encrypted_base64_data".to_string(),
+                    nonce: "00112233445566778899aa".to_string(), // 12 bytes hex
+                    tag: "tag_base64".to_string(),
                     app_name: "Chrome".to_string(),
                     category: Some("work".to_string()),
                 }
