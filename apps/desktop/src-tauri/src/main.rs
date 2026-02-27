@@ -35,19 +35,24 @@ fn main() {
       let sync_client = SyncClient::new(db_arc.clone());
 
       // Initialize crypto key for sync (use default key for development)
-      // In production, this should be derived from user password
-      // Use tokio runtime to run async initialization
-      let runtime = tokio::runtime::Runtime::new()
-        .expect("Failed to create tokio runtime");
+      // In production, this should be derived from user password using Argon2id
       let default_key = b"lifespan-dev-key-32-bytes-long!!";  // 32 bytes for AES-256
-      runtime.block_on(async {
-        sync_client.set_crypto_key(*default_key).await
-          .expect("Failed to initialize crypto key");
+
+      // Initialize crypto key synchronously using block_on
+      let rt = tokio::runtime::Runtime::new()
+        .expect("Failed to create tokio runtime");
+      rt.block_on(async {
+        if let Err(e) = sync_client.set_crypto_key(*default_key).await {
+          eprintln!("Failed to initialize crypto key: {}", e);
+        }
       });
 
       // Store in app state
       app.manage(Arc::new(tokio::sync::Mutex::new(collector)));
       app.manage(sync_client);
+
+      Ok(())
+    })
     .invoke_handler(tauri::generate_handler![
       commands::start_tracking,
       commands::stop_tracking,
