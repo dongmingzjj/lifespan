@@ -28,12 +28,12 @@ pub struct SyncStatus {
     pub last_error: Option<String>,
 }
 
-/// Sync result from server
+/// Sync result from server (matches backend API response)
 #[derive(Debug, Serialize, Deserialize)]
 struct SyncResponse {
-    synced: i32,
-    failed: i32,
-    sync_time: String,
+    synced_at: i64,           // Timestamp when sync completed
+    processed_count: i32,     // Number of events processed
+    conflicts: Vec<serde_json::Value>,  // Array of conflict objects (usually empty)
 }
 
 /// Event to send to server
@@ -440,7 +440,11 @@ impl SyncClient {
                 .await
                 .map_err(|e| SyncError::Unknown(format!("Failed to parse response: {}", e)))?;
 
-            tracing::info!("Sync successful: {} events synced", sync_response.synced);
+            tracing::info!(
+                "Sync successful: {} events processed at {}",
+                sync_response.processed_count,
+                sync_response.synced_at
+            );
             Ok(())
         } else {
             match status.as_u16() {
@@ -627,11 +631,12 @@ mod tests {
 
     #[test]
     fn test_sync_response_deserialization() {
-        let json = r#"{"synced":100,"failed":0,"sync_time":"2024-01-01T00:00:00Z"}"#;
+        let json = r#"{"synced_at":1704067200000,"processed_count":100,"conflicts":[]}"#;
         let response: SyncResponse = serde_json::from_str(json).unwrap();
 
-        assert_eq!(response.synced, 100);
-        assert_eq!(response.failed, 0);
+        assert_eq!(response.synced_at, 1704067200000);
+        assert_eq!(response.processed_count, 100);
+        assert!(response.conflicts.is_empty());
     }
 
     #[test]
