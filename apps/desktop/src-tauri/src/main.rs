@@ -12,7 +12,22 @@ use std::sync::Arc;
 use sync::SyncClient;
 use tauri::Manager;
 
+fn init_tracing() {
+  use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+  let env_filter = EnvFilter::try_from_default_env()
+    .unwrap_or_else(|_| EnvFilter::new("info"));
+
+  tracing_subscriber::registry()
+    .with(env_filter)
+    .with(fmt::layer())
+    .init();
+}
+
 fn main() {
+  // Initialize tracing
+  init_tracing();
+
   tauri::Builder::default()
     .setup(|app| {
       // Initialize database

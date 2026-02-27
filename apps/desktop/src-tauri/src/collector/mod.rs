@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{info, debug, error};
 use window_tracker::WindowTracker;
 
 #[derive(Debug, Serialize)]
@@ -59,6 +60,8 @@ impl Collector {
     let events_collected = self.events_collected.clone();
     let active_window = self.active_window.clone();
 
+    info!("Collector tracking loop started");
+
     tokio::spawn(async move {
       let mut last_window: Option<String> = None;
 
@@ -67,6 +70,7 @@ impl Collector {
         {
           let running = is_running.lock().await;
           if !*running {
+            info!("Collector stopping - is_running flag is false");
             break;
           }
         }
@@ -75,6 +79,7 @@ impl Collector {
         let should_wait = match idle_detector.is_idle(Duration::from_secs(300)) {
           Ok(is_idle) => {
             if is_idle {
+              debug!("User is idle, waiting 5 seconds...");
               // User is idle, wait and check again
               tokio::time::sleep(Duration::from_secs(5)).await;
               true
@@ -83,7 +88,7 @@ impl Collector {
             }
           }
           Err(e) => {
-            eprintln!("Idle detector error: {}", e);
+            error!("Idle detector error: {}", e);
             false
           }
         };
@@ -98,12 +103,21 @@ impl Collector {
           Ok(window_info) => {
             let current_window = Some(window_info.process_name.clone());
 
+            debug!("Current window: {:?}, Last window: {:?}", current_window, last_window);
+
             // Check if window changed
             if last_window != current_window {
-              if last_window.is_some() {
-                // Log the end of previous window usage
-                let mut count = events_collected.lock().await;
-                *count += 1;
+              // ALWAYS increment counter on window change (including first window)
+              let mut count = events_collected.lock().await;
+              *count += 1;
+              let current_count = *count;
+              drop(count);
+
+              // Log the window change
+              if let Some(prev) = &last_window {
+                info!("Window changed: '{}' -> '{}', total events: {}", prev, window_info.process_name, current_count);
+              } else {
+                info!("First window detected: '{}', total events: {}", window_info.process_name, current_count);
               }
 
               last_window = current_window.clone();
@@ -117,25 +131,33 @@ impl Collector {
               ));
 
               // Store event in database
+              debug!("Storing event in database...");
               if let Err(e) = db.store_event(&window_info).await {
-                eprintln!("Failed to store event: {}", e);
+                error!("Failed to store event: {}", e);
+              } else {
+                debug!("Event stored successfully");
               }
+            } else {
+              debug!("Window unchanged: {:?}", current_window);
             }
           }
           Err(e) => {
-            eprintln!("Window tracker error: {}", e);
+            error!("Window tracker error: {}", e);
           }
         }
 
         // Wait before next poll
         tokio::time::sleep(Duration::from_secs(1)).await;
       }
+
+      info!("Collector tracking loop ended");
     });
 
     Ok(())
   }
 
   pub async fn stop(&self) -> Result<()> {
+    info!("Collector stop requested");
     let mut is_running = self.is_running.lock().await;
     *is_running = false;
 
@@ -143,6 +165,7 @@ impl Collector {
     let mut active = self.active_window.lock().await;
     *active = None;
 
+    info!("Collector stop completed");
     Ok(())
   }
 
