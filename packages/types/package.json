@@ -1,0 +1,9 @@
+{
+  "name": "@lifespan/types",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "typescript": "^5.0.0"
+  }
+}
